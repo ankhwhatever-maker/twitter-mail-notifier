@@ -25,5 +25,7 @@ jobs:
       - name: Run script
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+          
         run: |
           python main.py
