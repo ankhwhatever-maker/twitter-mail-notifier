@@ -8,7 +8,7 @@ def send_mail(message):
     resend.Emails.send(
         {
             "from": "onboarding@resend.dev",
-            "to": "ankh.yuta2@gmail.com",
+            "to": os.environ["TO_EMAIL"],
             "subject": "X通知テスト",
             "html": f"""
             <h2>X通知</h2>
