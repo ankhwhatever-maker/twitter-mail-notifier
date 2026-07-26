@@ -23,11 +23,11 @@ def get_latest_posts():
 
         page.goto(
             url,
-            wait_until="networkidle",
+            wait_until="domcontentloaded",
             timeout=60000
         )
 
-        page.wait_for_timeout(5000)
+        page.wait_for_timeout(10000)
 
         articles = page.locator("article").all()
 
