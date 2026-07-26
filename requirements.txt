@@ -1,3 +1,2 @@
 resend
 requests
-snscrape
