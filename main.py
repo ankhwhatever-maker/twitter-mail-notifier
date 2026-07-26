@@ -1,14 +1,11 @@
 import os
-import requests
+import resend
 from datetime import datetime
-from resend import Resend
 
-RESEND_API_KEY = os.environ["RESEND_API_KEY"]
-
-resend = Resend(RESEND_API_KEY)
+resend.api_key = os.environ["RESEND_API_KEY"]
 
 def send_mail(message):
-    resend.emails.send(
+    resend.Emails.send(
         {
             "from": "onboarding@resend.dev",
             "to": "ankh.yuta2@gmail.com",
