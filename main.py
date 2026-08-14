@@ -16,6 +16,10 @@ resend.api_key = os.environ["RESEND_API_KEY"]
 LAST_FILE = "last_post.txt"
 MAX_ATTEMPTS = 3
 RETRY_DELAY_MS = 3000
+MAX_POSTS = 100
+MAX_SCROLLS = 25
+SCROLL_WAIT_MS = 1500
+MAX_STAGNANT_SCROLLS = 3
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,30 +77,70 @@ def parse_post_url(url):
     }
 
 
-def extract_posts(page):
+def extract_visible_posts(page):
     posts = []
     seen_ids = set()
 
-    for article in page.locator("article").all()[:10]:
-        try:
-            text = article.inner_text()
-            links = article.locator("a").evaluate_all("(els)=>els.map(e=>e.href)")
-            post_links = [parse_post_url(link) for link in links]
-            post_links = [post for post in post_links if post is not None]
+    for article in page.locator("article").all():
+        text = article.inner_text()
+        links = article.locator("a").evaluate_all("(els)=>els.map(e=>e.href)")
+        post_links = [parse_post_url(link) for link in links]
+        post_links = [post for post in post_links if post is not None]
 
-            if post_links:
-                post = post_links[0]
-                if post["id"] in seen_ids:
-                    continue
-                seen_ids.add(post["id"])
-                posts.append({**post, "text": text})
-        except Exception:
-            logger.exception("Failed to parse an article; continuing with the others")
+        if post_links:
+            post = post_links[0]
+            if post["id"] in seen_ids:
+                continue
+            seen_ids.add(post["id"])
+            posts.append({**post, "text": text})
 
     return posts
 
 
-def get_posts():
+def collect_posts(page, last_id):
+    collected = {}
+    stagnant_scrolls = 0
+
+    for scroll_count in range(MAX_SCROLLS + 1):
+        previous_count = len(collected)
+        for post in extract_visible_posts(page):
+            collected[post["id"]] = post
+
+        if not collected:
+            raise RuntimeError("No matching posts were found in the loaded articles")
+
+        if last_id is None or last_id in collected:
+            return list(collected.values())
+
+        if len(collected) >= MAX_POSTS:
+            raise RuntimeError(
+                f"Previous post ID {last_id} was not found within {MAX_POSTS} posts; "
+                "refusing to advance state"
+            )
+
+        if len(collected) == previous_count:
+            stagnant_scrolls += 1
+        else:
+            stagnant_scrolls = 0
+
+        if stagnant_scrolls >= MAX_STAGNANT_SCROLLS or scroll_count == MAX_SCROLLS:
+            break
+
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(SCROLL_WAIT_MS)
+
+    posts = list(collected.values())
+    has_newer_posts = any(int(post["id"]) > int(last_id) for post in posts)
+    if has_newer_posts:
+        raise RuntimeError(
+            f"Previous post ID {last_id} was not found after scrolling; "
+            "refusing to send an incomplete notification or advance state"
+        )
+
+    return posts
+
+
+def get_posts(last_id):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         url = f"https://x.com/{USERNAME}"
@@ -112,9 +156,7 @@ def get_posts():
                     timeout=60000,
                 )
                 page.locator("article").first.wait_for(state="visible", timeout=30000)
-                posts = extract_posts(page)
-                if not posts:
-                    raise RuntimeError("No matching posts were found in the loaded articles")
+                posts = collect_posts(page, last_id)
 
                 logger.info("Extracted %d posts for @%s", len(posts), USERNAME)
                 return posts
@@ -160,29 +202,28 @@ def send_mail(posts):
 
 def main():
     last_id = get_last_post_id()
-    posts = get_posts()
-    new_posts = [
-        post for post in posts if last_id is None or int(post["id"]) > int(last_id)
-    ]
+    posts = get_posts(last_id)
 
-    fetched_ids = {post["id"] for post in posts}
-    if last_id is not None and last_id not in fetched_ids:
-        logger.warning(
-            "Previous post ID %s was not among the %d fetched posts; "
-            "sending only visible posts with a newer ID",
-            last_id,
-            len(posts),
+    newest_id = max((post["id"] for post in posts), key=int)
+    if last_id is None:
+        save_last_post_id(newest_id)
+        logger.info(
+            "Initialized state at post ID %s without sending existing posts",
+            newest_id,
         )
+        return
+
+    new_posts = [
+        post for post in posts if int(post["id"]) > int(last_id)
+    ]
 
     if not new_posts:
         logger.info("No new posts")
-        if last_id is not None:
-            save_last_post_id(last_id)
+        save_last_post_id(last_id)
         return
 
     new_posts.sort(key=lambda post: int(post["id"]))
     send_mail(new_posts)
-    newest_id = max((post["id"] for post in posts), key=int)
     save_last_post_id(newest_id)
     logger.info("Sent %d posts and saved state ID %s", len(new_posts), newest_id)
 
