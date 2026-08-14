@@ -5,6 +5,13 @@ on:
     - cron: "0 0 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+concurrency:
+  group: x-notification-mail
+  cancel-in-progress: false
+
 jobs:
   send-mail:
     runs-on: ubuntu-latest
@@ -31,3 +38,17 @@ jobs:
           
         run: |
           python main.py
+
+      - name: Persist last post
+        run: |
+          if git diff --quiet -- last_post.txt; then
+            echo "State is unchanged"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last_post.txt
+          git commit -m "Update last notified X post"
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"
