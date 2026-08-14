@@ -1,10 +1,11 @@
+import html
 import logging
 import os
 import re
 from urllib.parse import urlparse
 
 import resend
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 USERNAME = os.environ["X_USERNAME"].lstrip("@")
@@ -13,6 +14,8 @@ TO_EMAIL = os.environ["TO_EMAIL"]
 resend.api_key = os.environ["RESEND_API_KEY"]
 
 LAST_FILE = "last_post.txt"
+MAX_ATTEMPTS = 3
+RETRY_DELAY_MS = 3000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,19 +32,32 @@ POST_PATH = re.compile(
 )
 
 
-def get_last_post():
+def get_last_post_id():
     if os.path.exists(LAST_FILE):
         with open(LAST_FILE, "r") as f:
-            return f.read().strip()
-    return ""
+            value = f.read().strip()
+
+        if not value:
+            return None
+        if value.isdigit():
+            return value
+
+        parsed = parse_post_url(value)
+        if parsed:
+            logger.info("Migrating saved state from URL to post ID")
+            return parsed["id"]
+
+        raise RuntimeError(f"Invalid state in {LAST_FILE}: {value!r}")
+
+    return None
 
 
-def save_last_post(post_url):
+def save_last_post_id(post_id):
     with open(LAST_FILE, "w") as f:
-        f.write(post_url)
+        f.write(post_id)
 
 
-def canonical_post_url(url):
+def parse_post_url(url):
     parsed = urlparse(url)
     if parsed.hostname not in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}:
         return None
@@ -50,80 +66,85 @@ def canonical_post_url(url):
     if not match:
         return None
 
-    return f"https://x.com/{USERNAME}/status/{match.group('id')}"
+    post_id = match.group("id")
+    return {
+        "id": post_id,
+        "url": f"https://x.com/{USERNAME}/status/{post_id}",
+    }
 
 
-def get_posts():
-
+def extract_posts(page):
     posts = []
+    seen_ids = set()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-
-        page = browser.new_page()
-
-        url = f"https://x.com/{USERNAME}"
-
+    for article in page.locator("article").all()[:10]:
         try:
-            page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-            page.locator("article").first.wait_for(state="visible", timeout=30000)
-        except PlaywrightTimeoutError as exc:
-            raise RuntimeError(f"Timed out while loading @{USERNAME}'s posts") from exc
+            text = article.inner_text()
+            links = article.locator("a").evaluate_all("(els)=>els.map(e=>e.href)")
+            post_links = [parse_post_url(link) for link in links]
+            post_links = [post for post in post_links if post is not None]
 
-        articles = page.locator("article").all()
-        seen_urls = set()
+            if post_links:
+                post = post_links[0]
+                if post["id"] in seen_ids:
+                    continue
+                seen_ids.add(post["id"])
+                posts.append({**post, "text": text})
+        except Exception:
+            logger.exception("Failed to parse an article; continuing with the others")
 
-        for article in articles[:10]:
-            try:
-                text = article.inner_text()
-
-                links = article.locator("a").evaluate_all(
-                    "(els)=>els.map(e=>e.href)"
-                )
-
-                post_links = [canonical_post_url(link) for link in links]
-                post_links = [link for link in post_links if link is not None]
-
-                if post_links:
-                    post_url = post_links[0]
-                    if post_url in seen_urls:
-                        continue
-                    seen_urls.add(post_url)
-                    posts.append(
-                        {
-                            "url": post_url,
-                            "text": text,
-                        }
-                    )
-
-            except Exception:
-                logger.exception("Failed to parse an article; continuing with the others")
-
-        browser.close()
-
-    if not posts:
-        raise RuntimeError(
-            f"No posts for @{USERNAME} could be extracted; X may have changed its page"
-        )
-
-    logger.info("Extracted %d posts for @%s", len(posts), USERNAME)
     return posts
 
 
-def send_mail(posts):
+def get_posts():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        url = f"https://x.com/{USERNAME}"
+        last_error = None
 
-    html = f"<h2>@{USERNAME} 新しい投稿</h2>"
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            page = browser.new_page()
+            try:
+                logger.info("Loading @%s (attempt %d/%d)", USERNAME, attempt, MAX_ATTEMPTS)
+                page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                page.locator("article").first.wait_for(state="visible", timeout=30000)
+                posts = extract_posts(page)
+                if not posts:
+                    raise RuntimeError("No matching posts were found in the loaded articles")
+
+                logger.info("Extracted %d posts for @%s", len(posts), USERNAME)
+                return posts
+            except (PlaywrightError, RuntimeError) as exc:
+                last_error = exc
+                logger.warning("Attempt %d/%d failed: %s", attempt, MAX_ATTEMPTS, exc)
+                if attempt < MAX_ATTEMPTS:
+                    page.wait_for_timeout(RETRY_DELAY_MS * attempt)
+            finally:
+                page.close()
+
+        browser.close()
+
+    raise RuntimeError(
+        f"Failed to load @{USERNAME}'s posts after {MAX_ATTEMPTS} attempts"
+    ) from last_error
+
+
+def send_mail(posts):
+    escaped_username = html.escape(USERNAME)
+    message_html = f"<h2>@{escaped_username} 新しい投稿</h2>"
 
     for p in posts:
-        html += f"""
+        escaped_text = html.escape(p["text"]).replace("\n", "<br>\n")
+        escaped_url = html.escape(p["url"], quote=True)
+        message_html += f"""
         <hr>
-        <p>{p['text']}</p>
-        <a href="{p['url']}">
-        {p['url']}
+        <p>{escaped_text}</p>
+        <a href="{escaped_url}">
+        {escaped_url}
         </a>
         """
 
@@ -132,29 +153,38 @@ def send_mail(posts):
             "from": "onboarding@resend.dev",
             "to": TO_EMAIL,
             "subject": f"@{USERNAME} 新着投稿 {len(posts)}件",
-            "html": html,
+            "html": message_html,
         }
     )
 
 
 def main():
-    last = get_last_post()
+    last_id = get_last_post_id()
     posts = get_posts()
-    new_posts = []
+    new_posts = [
+        post for post in posts if last_id is None or int(post["id"]) > int(last_id)
+    ]
 
-    for post in posts:
-        if post["url"] == last:
-            break
-        new_posts.append(post)
+    fetched_ids = {post["id"] for post in posts}
+    if last_id is not None and last_id not in fetched_ids:
+        logger.warning(
+            "Previous post ID %s was not among the %d fetched posts; "
+            "sending only visible posts with a newer ID",
+            last_id,
+            len(posts),
+        )
 
     if not new_posts:
         logger.info("No new posts")
+        if last_id is not None:
+            save_last_post_id(last_id)
         return
 
-    new_posts.reverse()
+    new_posts.sort(key=lambda post: int(post["id"]))
     send_mail(new_posts)
-    save_last_post(posts[0]["url"])
-    logger.info("Sent %d posts and saved state %s", len(new_posts), posts[0]["url"])
+    newest_id = max((post["id"] for post in posts), key=int)
+    save_last_post_id(newest_id)
+    logger.info("Sent %d posts and saved state ID %s", len(new_posts), newest_id)
 
 
 if __name__ == "__main__":
