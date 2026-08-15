@@ -31,24 +31,31 @@ jobs:
           playwright install chromium
 
       - name: Run script
+        id: notifier
+        continue-on-error: true
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
-          X_USERNAME: ${{ secrets.X_USERNAME }}
+          X_USERNAMES: ${{ secrets.X_USERNAME }},pokecayoyaku
           
         run: |
           python main.py
 
       - name: Persist last post
+        if: always()
         run: |
-          if git diff --quiet -- last_post.txt; then
+          if [ -z "$(git status --porcelain -- state)" ]; then
             echo "State is unchanged"
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add last_post.txt
-          git commit -m "Update last notified X post"
+          git add state
+          git commit -m "Update last notified X posts"
           git pull --rebase origin "$GITHUB_REF_NAME"
           git push origin "HEAD:$GITHUB_REF_NAME"
+
+      - name: Report notifier failure
+        if: steps.notifier.outcome == 'failure'
+        run: exit 1
