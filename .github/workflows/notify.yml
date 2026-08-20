@@ -41,6 +41,15 @@ jobs:
         run: |
           python main.py
 
+      - name: Upload failure diagnostics
+        if: steps.notifier.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: x-notifier-diagnostics-${{ github.run_id }}
+          path: diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Persist last post
         if: always()
         run: |

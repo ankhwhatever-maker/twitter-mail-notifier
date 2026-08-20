@@ -23,6 +23,7 @@ USERNAMES = list(
 )
 
 STATE_DIR = Path("state")
+DIAGNOSTICS_DIR = Path("diagnostics")
 LEGACY_LAST_FILE = Path("last_post.txt")
 MAX_ATTEMPTS = 3
 RETRY_DELAY_MS = 3000
@@ -137,10 +138,13 @@ def collect_posts(page, username, last_id):
             return list(collected.values())
 
         if len(collected) >= MAX_POSTS:
-            raise RuntimeError(
-                f"Previous post ID {last_id} was not found within {MAX_POSTS} posts; "
-                "refusing to advance state"
+            logger.warning(
+                "Previous post ID %s was not found within %d posts; "
+                "continuing with posts that have a newer ID",
+                last_id,
+                MAX_POSTS,
             )
+            return list(collected.values())
 
         if len(collected) == previous_count:
             stagnant_scrolls += 1
@@ -156,12 +160,56 @@ def collect_posts(page, username, last_id):
     posts = list(collected.values())
     has_newer_posts = any(int(post["id"]) > int(last_id) for post in posts)
     if has_newer_posts:
-        raise RuntimeError(
-            f"Previous post ID {last_id} was not found after scrolling; "
-            "refusing to send an incomplete notification or advance state"
+        logger.warning(
+            "Previous post ID %s was not found after scrolling; "
+            "continuing with %d visible posts that have a newer ID",
+            last_id,
+            sum(int(post["id"]) > int(last_id) for post in posts),
         )
 
     return posts
+
+
+def save_diagnostics(page, username, error):
+    DIAGNOSTICS_DIR.mkdir(exist_ok=True)
+    screenshot_path = DIAGNOSTICS_DIR / f"{username.lower()}.png"
+    details_path = DIAGNOSTICS_DIR / f"{username.lower()}.txt"
+
+    try:
+        title = page.title()
+    except PlaywrightError as exc:
+        title = f"<unavailable: {exc}>"
+
+    try:
+        body = page.locator("body").inner_text(timeout=5000)
+    except PlaywrightError as exc:
+        body = f"<unavailable: {exc}>"
+
+    details_path.write_text(
+        "\n".join(
+            [
+                f"error: {error}",
+                f"url: {page.url}",
+                f"title: {title}",
+                "",
+                "body excerpt:",
+                body[:4000],
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        page.screenshot(path=str(screenshot_path), full_page=True)
+    except PlaywrightError:
+        logger.exception("Failed to save screenshot for @%s", username)
+
+    logger.error(
+        "Saved failure diagnostics for @%s (URL: %s, title: %s)",
+        username,
+        page.url,
+        title,
+    )
 
 
 def get_posts(username, last_id):
@@ -189,6 +237,11 @@ def get_posts(username, last_id):
                 logger.warning("Attempt %d/%d failed: %s", attempt, MAX_ATTEMPTS, exc)
                 if attempt < MAX_ATTEMPTS:
                     page.wait_for_timeout(RETRY_DELAY_MS * attempt)
+                else:
+                    try:
+                        save_diagnostics(page, username, exc)
+                    except Exception:
+                        logger.exception("Failed to save diagnostics for @%s", username)
             finally:
                 page.close()
 
