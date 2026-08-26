@@ -185,12 +185,18 @@ def save_diagnostics(page, username, error):
     except PlaywrightError as exc:
         body = f"<unavailable: {exc}>"
 
+    try:
+        html_length = len(page.content())
+    except PlaywrightError as exc:
+        html_length = f"<unavailable: {exc}>"
+
     details_path.write_text(
         "\n".join(
             [
                 f"error: {error}",
                 f"url: {page.url}",
                 f"title: {title}",
+                f"html length: {html_length}",
                 "",
                 "body excerpt:",
                 body[:4000],
@@ -214,18 +220,44 @@ def save_diagnostics(page, username, error):
 
 def get_posts(username, last_id):
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(channel="chromium", headless=True)
         url = f"https://x.com/{username}"
         last_error = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            page = browser.new_page()
+            page = browser.new_page(
+                locale="ja-JP",
+                timezone_id="Asia/Tokyo",
+                viewport={"width": 1280, "height": 900},
+            )
+            console_errors = []
+            failed_requests = []
+            page.on(
+                "console",
+                lambda message: console_errors.append(message.text)
+                if message.type == "error"
+                else None,
+            )
+            page.on(
+                "requestfailed",
+                lambda request: failed_requests.append(
+                    f"{request.method} {request.url}: {request.failure}"
+                ),
+            )
             try:
                 logger.info("Loading @%s (attempt %d/%d)", username, attempt, MAX_ATTEMPTS)
-                page.goto(
+                response = page.goto(
                     url,
                     wait_until="domcontentloaded",
                     timeout=60000,
+                )
+                if response is None:
+                    raise RuntimeError("Navigation completed without an HTTP response")
+                logger.info(
+                    "Loaded @%s with HTTP %d (%d HTML characters)",
+                    username,
+                    response.status,
+                    len(page.content()),
                 )
                 page.locator("article").first.wait_for(state="visible", timeout=30000)
                 posts = collect_posts(page, username, last_id)
@@ -238,6 +270,18 @@ def get_posts(username, last_id):
                 if attempt < MAX_ATTEMPTS:
                     page.wait_for_timeout(RETRY_DELAY_MS * attempt)
                 else:
+                    if console_errors:
+                        logger.error(
+                            "Browser console errors for @%s: %s",
+                            username,
+                            " | ".join(console_errors[-10:]),
+                        )
+                    if failed_requests:
+                        logger.error(
+                            "Failed browser requests for @%s: %s",
+                            username,
+                            " | ".join(failed_requests[-10:]),
+                        )
                     try:
                         save_diagnostics(page, username, exc)
                     except Exception:
