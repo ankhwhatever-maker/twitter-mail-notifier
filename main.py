@@ -1,25 +1,26 @@
 import html
+import json
 import logging
 import os
 import re
-from urllib.parse import urlparse
+import time
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 
 import resend
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import sync_playwright
 
 USERNAME = os.environ["X_USERNAME"].lstrip("@")
 TO_EMAIL = os.environ["TO_EMAIL"]
 
 resend.api_key = os.environ["RESEND_API_KEY"]
 
-LAST_FILE = "last_post.txt"
+LAST_FILE = Path("last_post.txt")
+DIAGNOSTICS_DIR = Path("diagnostics")
 MAX_ATTEMPTS = 3
-RETRY_DELAY_MS = 3000
-MAX_POSTS = 100
-MAX_SCROLLS = 25
-SCROLL_WAIT_MS = 1500
-MAX_STAGNANT_SCROLLS = 3
+RETRY_DELAY_SECONDS = 3
+YAHOO_REALTIME_URL = "https://search.yahoo.co.jp/realtime/search"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,12 +35,15 @@ POST_PATH = re.compile(
     rf"^/{re.escape(USERNAME)}/status/(?P<id>\d+)(?:/.*)?$",
     re.IGNORECASE,
 )
+NEXT_DATA_PATTERN = re.compile(
+    r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+    re.DOTALL,
+)
 
 
 def get_last_post_id():
-    if os.path.exists(LAST_FILE):
-        with open(LAST_FILE, "r") as f:
-            value = f.read().strip()
+    if LAST_FILE.exists():
+        value = LAST_FILE.read_text(encoding="utf-8").strip()
 
         if not value:
             return None
@@ -57,8 +61,7 @@ def get_last_post_id():
 
 
 def save_last_post_id(post_id):
-    with open(LAST_FILE, "w") as f:
-        f.write(post_id)
+    LAST_FILE.write_text(post_id, encoding="utf-8")
 
 
 def parse_post_url(url):
@@ -77,101 +80,70 @@ def parse_post_url(url):
     }
 
 
-def extract_visible_posts(page):
+def extract_yahoo_posts(document):
+    match = NEXT_DATA_PATTERN.search(document)
+    if not match:
+        raise RuntimeError("Yahoo realtime response did not contain __NEXT_DATA__")
+
+    try:
+        page_data = json.loads(match.group(1))["props"]["pageProps"]["pageData"]
+        entries = page_data["timeline"]["entry"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError("Yahoo realtime response format has changed") from exc
+
     posts = []
     seen_ids = set()
+    for entry in entries:
+        if str(entry.get("screenName", "")).lower() != USERNAME.lower():
+            continue
+        parsed = parse_post_url(str(entry.get("url", "")))
+        if parsed is None or parsed["id"] in seen_ids:
+            continue
+        seen_ids.add(parsed["id"])
+        posts.append({**parsed, "text": str(entry.get("displayTextBody", "")).strip()})
 
-    for article in page.locator("article").all():
-        text = article.inner_text()
-        links = article.locator("a").evaluate_all("(els)=>els.map(e=>e.href)")
-        post_links = [parse_post_url(link) for link in links]
-        post_links = [post for post in post_links if post is not None]
-
-        if post_links:
-            post = post_links[0]
-            if post["id"] in seen_ids:
-                continue
-            seen_ids.add(post["id"])
-            posts.append({**post, "text": text})
-
+    if not posts:
+        raise RuntimeError(f"Yahoo realtime returned no posts for @{USERNAME}")
     return posts
 
 
-def collect_posts(page, last_id):
-    collected = {}
-    stagnant_scrolls = 0
-
-    for scroll_count in range(MAX_SCROLLS + 1):
-        previous_count = len(collected)
-        for post in extract_visible_posts(page):
-            collected[post["id"]] = post
-
-        if not collected:
-            raise RuntimeError("No matching posts were found in the loaded articles")
-
-        if last_id is None or last_id in collected:
-            return list(collected.values())
-
-        if len(collected) >= MAX_POSTS:
-            raise RuntimeError(
-                f"Previous post ID {last_id} was not found within {MAX_POSTS} posts; "
-                "refusing to advance state"
-            )
-
-        if len(collected) == previous_count:
-            stagnant_scrolls += 1
-        else:
-            stagnant_scrolls = 0
-
-        if stagnant_scrolls >= MAX_STAGNANT_SCROLLS or scroll_count == MAX_SCROLLS:
-            break
-
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(SCROLL_WAIT_MS)
-
-    posts = list(collected.values())
-    has_newer_posts = any(int(post["id"]) > int(last_id) for post in posts)
-    if has_newer_posts:
-        raise RuntimeError(
-            f"Previous post ID {last_id} was not found after scrolling; "
-            "refusing to send an incomplete notification or advance state"
-        )
-
-    return posts
+def save_diagnostics(document, error):
+    DIAGNOSTICS_DIR.mkdir(exist_ok=True)
+    (DIAGNOSTICS_DIR / "yahoo-realtime.html").write_text(document, encoding="utf-8")
+    (DIAGNOSTICS_DIR / "error.txt").write_text(str(error), encoding="utf-8")
 
 
-def get_posts(last_id):
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        url = f"https://x.com/{USERNAME}"
-        last_error = None
+def get_posts():
+    url = f"{YAHOO_REALTIME_URL}?{urlencode({'p': f'ID:{USERNAME}'})}"
+    last_error = None
+    document = ""
 
-        for attempt in range(1, MAX_ATTEMPTS + 1):
-            page = browser.new_page()
-            try:
-                logger.info("Loading @%s (attempt %d/%d)", USERNAME, attempt, MAX_ATTEMPTS)
-                page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                page.locator("article").first.wait_for(state="visible", timeout=30000)
-                posts = collect_posts(page, last_id)
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        logger.info("Loading Yahoo realtime for @%s (attempt %d/%d)", USERNAME, attempt, MAX_ATTEMPTS)
+        request = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        })
+        try:
+            with urlopen(request, timeout=30) as response:
+                document = response.read().decode("utf-8", errors="replace")
+                logger.info("Loaded Yahoo realtime with HTTP %d (%d characters)", response.status, len(document))
+            posts = extract_yahoo_posts(document)
+            logger.info("Extracted %d posts for @%s", len(posts), USERNAME)
+            return posts
+        except HTTPError as exc:
+            document = exc.read().decode("utf-8", errors="replace")
+            last_error = RuntimeError(f"Yahoo realtime returned HTTP {exc.code}")
+        except (URLError, TimeoutError, RuntimeError) as exc:
+            last_error = exc
 
-                logger.info("Extracted %d posts for @%s", len(posts), USERNAME)
-                return posts
-            except (PlaywrightError, RuntimeError) as exc:
-                last_error = exc
-                logger.warning("Attempt %d/%d failed: %s", attempt, MAX_ATTEMPTS, exc)
-                if attempt < MAX_ATTEMPTS:
-                    page.wait_for_timeout(RETRY_DELAY_MS * attempt)
-            finally:
-                page.close()
+        logger.warning("Attempt %d/%d failed: %s", attempt, MAX_ATTEMPTS, last_error)
+        if attempt < MAX_ATTEMPTS:
+            time.sleep(RETRY_DELAY_SECONDS * attempt)
 
-        browser.close()
-
+    save_diagnostics(document, last_error)
     raise RuntimeError(
-        f"Failed to load @{USERNAME}'s posts after {MAX_ATTEMPTS} attempts"
+        f"Failed to load @{USERNAME}'s posts from Yahoo realtime after {MAX_ATTEMPTS} attempts"
     ) from last_error
 
 
@@ -202,7 +174,7 @@ def send_mail(posts):
 
 def main():
     last_id = get_last_post_id()
-    posts = get_posts(last_id)
+    posts = get_posts()
 
     newest_id = max((post["id"] for post in posts), key=int)
     if last_id is None:
@@ -219,7 +191,6 @@ def main():
 
     if not new_posts:
         logger.info("No new posts")
-        save_last_post_id(last_id)
         return
 
     new_posts.sort(key=lambda post: int(post["id"]))
